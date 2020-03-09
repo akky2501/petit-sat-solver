@@ -136,8 +136,7 @@ struct Clause {
 }
 
 impl Clause {
-    fn notice_neg(&mut self, lit: Lit, assigns: &Assignment) {
-        // TODO: unwatch clause
+    fn notice_neg(&mut self, lit: Lit, assigns: &Assignment) -> Lit {
         for i in 0..2 {
             let n = self.lits.len();
             let wl1 = self.wl[(i + 1) % 2];
@@ -153,9 +152,10 @@ impl Clause {
                     }
                     new_wl = (new_wl + 1) % n;
                 }
-                break;
+                return self.lits[*wl0]; // return new watched literal
             }
         }
+        unreachable!()
     }
 
     fn is_unit(&self, assigns: &Assignment) -> Option<Lit> {
@@ -181,6 +181,7 @@ impl Clause {
 }
 
 #[derive(Debug)]
+// TODO: try HashMap
 struct ClauseMap {
     pos_map: Vec<Vec<usize>>,
     neg_map: Vec<Vec<usize>>,
@@ -208,6 +209,21 @@ impl ClauseMap {
             self.neg_map[-l as usize].push(c);
         }
     }
+
+    fn delete(&mut self, l: Lit, c: usize) {
+        let map = if l > 0 {
+            &mut self.pos_map[l as usize]
+        } else {
+            &mut self.neg_map[-l as usize]
+        };
+
+        for i in 0..map.len() {
+            if map[i] == c {
+                map.swap_remove(i);
+                return;
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -233,9 +249,8 @@ impl Solver {
 
         let mut clause_map = ClauseMap::new(p.variables);
         for (idx, c) in db.iter().enumerate() {
-            for &l in &c.lits {
-                clause_map.insert(l, idx);
-            }
+            clause_map.insert(c.lits[0], idx); // watch literal/clause
+            clause_map.insert(c.lits[1], idx);
         }
 
         Solver {
@@ -317,8 +332,16 @@ impl Solver {
         let l = x as Lit;
         if self.assigns.is_def(l) {
             let neglit = if self.assigns.value(l) { -l } else { l };
+            let mut delete_list = vec![];
+            let mut insert_list = vec![];
             for &idx in self.clause_map.get(neglit) {
-                self.db[idx].notice_neg(neglit, &self.assigns);
+                let new_wl = self.db[idx].notice_neg(neglit, &self.assigns);
+                delete_list.push(idx); // unwatch clause
+                insert_list.push(new_wl); // watch new clause
+            }
+            for (idx, new_wl) in delete_list.into_iter().zip(insert_list.into_iter()) {
+                self.clause_map.delete(neglit, idx);
+                self.clause_map.insert(new_wl, idx);
             }
         }
     }
