@@ -54,66 +54,76 @@ fn parse_dimacs(text: &str) -> Result<Problem, ()> {
 type Var = usize;
 type Lit = i64;
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum AssignmentCell {
+    UnDef,
+    Def(bool),
+}
+
 #[derive(Debug)]
 struct Assignment {
-    base: usize,
-    defined: Vec<bool>,
-    values: Vec<bool>,
+    values: Vec<AssignmentCell>,
 }
 
 impl Assignment {
     fn new(n: usize) -> Self {
         Assignment {
-            base: n,
-            defined: vec![false; n + 1],
-            values: vec![false; 2 * n + 1],
+            values: vec![AssignmentCell::UnDef; n + 1],
         }
     }
 
+    #[inline]
     fn count(&self) -> usize {
-        self.base
+        self.values.len() - 1
     }
 
-    fn val_idx(&self, l: Lit) -> Var {
-        (self.base as Lit + l) as Var
-    }
-
+    #[inline]
     fn def_idx(&self, l: Lit) -> Var {
         l.abs() as Var
     }
 
+    #[inline]
     fn set_pos(&mut self, l: Lit) {
         let x = self.def_idx(l);
-        let p = self.val_idx(l);
-        let n = self.val_idx(-l);
-        self.defined[x] = true;
-        self.values[p] = true;
-        self.values[n] = false;
+        self.values[x] = AssignmentCell::Def(l > 0);
     }
 
+    #[inline]
     fn flip(&mut self, l: Lit) {
-        let p = self.val_idx(l);
-        let n = self.val_idx(-l);
-        // flip
-        self.values[p] = !self.values[p];
-        self.values[n] = !self.values[n];
+        let x = self.def_idx(l);
+        if let AssignmentCell::Def(ref mut b) = self.values[x] {
+            *b = !*b;
+        }
     }
 
+    #[inline]
     fn set_undef(&mut self, l: Lit) {
         let x = self.def_idx(l);
-        self.defined[x] = false;
+        self.values[x] = AssignmentCell::UnDef;
     }
 
+    #[inline]
     fn value(&self, l: Lit) -> bool {
-        let p = self.val_idx(l);
-        self.values[p]
+        let x = self.def_idx(l);
+        match self.values[x] {
+            AssignmentCell::Def(b) => {
+                if l > 0 {
+                    b
+                } else {
+                    !b
+                }
+            }
+            _ => unreachable!(),
+        }
     }
 
+    #[inline]
     fn is_def(&self, l: Lit) -> bool {
         let x = self.def_idx(l);
-        self.defined[x]
+        self.values[x] != AssignmentCell::UnDef
     }
 
+    #[inline]
     fn is_undef(&self, l: Lit) -> bool {
         !self.is_def(l)
     }
