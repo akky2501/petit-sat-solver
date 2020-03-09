@@ -54,18 +54,68 @@ fn parse_dimacs(text: &str) -> Result<Problem, ()> {
 type Var = usize;
 type Lit = i64;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Assignment {
-    UnDef,
-    Def(bool),
+#[derive(Debug)]
+struct Assignment {
+    base: usize,
+    defined: Vec<bool>,
+    values: Vec<bool>,
 }
 
 impl Assignment {
-    fn flip(&mut self) {
-        match self {
-            Assignment::Def(ref mut b) => *b = !*b,
-            _ => unreachable!(),
+    fn new(n: usize) -> Self {
+        Assignment {
+            base: n,
+            defined: vec![false; n + 1],
+            values: vec![false; 2 * n + 1],
         }
+    }
+
+    fn count(&self) -> usize {
+        self.base
+    }
+
+    fn val_idx(&self, l: Lit) -> Var {
+        (self.base as Lit + l) as Var
+    }
+
+    fn def_idx(&self, l: Lit) -> Var {
+        l.abs() as Var
+    }
+
+    fn set_pos(&mut self, l: Lit) {
+        let x = self.def_idx(l);
+        let p = self.val_idx(l);
+        let n = self.val_idx(-l);
+        self.defined[x] = true;
+        self.values[p] = true;
+        self.values[n] = false;
+    }
+
+    fn flip(&mut self, l: Lit) {
+        let p = self.val_idx(l);
+        let n = self.val_idx(-l);
+        // flip
+        self.values[p] = !self.values[p];
+        self.values[n] = !self.values[n];
+    }
+
+    fn set_undef(&mut self, l: Lit) {
+        let x = self.def_idx(l);
+        self.defined[x] = false;
+    }
+
+    fn value(&self, l: Lit) -> bool {
+        let p = self.val_idx(l);
+        self.values[p]
+    }
+
+    fn is_def(&self, l: Lit) -> bool {
+        let x = self.def_idx(l);
+        self.defined[x]
+    }
+
+    fn is_undef(&self, l: Lit) -> bool {
+        !self.is_def(l)
     }
 }
 
@@ -77,34 +127,31 @@ struct Clause {
 }
 
 impl Clause {
-    fn notice_pos(&mut self, _: Lit, _: &Vec<Assignment>) {
+    fn notice_pos(&mut self, _: Lit, _: &Assignment) {
         self.pos += 1;
     }
 
-    fn notice_neg(&mut self, _: Lit, _: &Vec<Assignment>) {
+    fn notice_neg(&mut self, _: Lit, _: &Assignment) {
         self.neg += 1;
     }
 
-    fn notice_pos_to_undef(&mut self, _: Lit, _: &Vec<Assignment>) {
+    fn notice_pos_to_undef(&mut self, _: Lit, _: &Assignment) {
         self.pos -= 1;
     }
 
-    fn notice_neg_to_undef(&mut self, _: Lit, _: &Vec<Assignment>) {
+    fn notice_neg_to_undef(&mut self, _: Lit, _: &Assignment) {
         self.neg -= 1;
     }
 
-    fn is_unit(&self, assigns: &Vec<Assignment>) -> Option<Lit> {
+    fn is_unit(&self, assigns: &Assignment) -> Option<Lit> {
         if self.pos == 0 && self.lits.len() - 1 == self.neg {
-            self.lits
-                .iter()
-                .find(|l| assigns[l.abs() as usize] == Assignment::UnDef)
-                .cloned()
+            self.lits.iter().find(|&&l| assigns.is_undef(l)).cloned()
         } else {
             None
         }
     }
 
-    fn is_conflict(&self, _: &Vec<Assignment>) -> bool {
+    fn is_conflict(&self, _: &Assignment) -> bool {
         self.pos == 0 && self.lits.len() == self.neg
     }
 }
@@ -141,11 +188,11 @@ impl ClauseMap {
 
 #[derive(Debug)]
 struct Solver {
-    assigns: Vec<Assignment>, // assigns of variables
-    db: Vec<Clause>,          // clause data base
-    clause_map: ClauseMap,    // literal -> clause index
-    decision: Vec<Var>,       // decision stack (trail), length is desision level
-    deduced: Vec<Var>,        // deduced literal trail (0 is for decision)
+    assigns: Assignment,   // assigns of variables
+    db: Vec<Clause>,       // clause data base
+    clause_map: ClauseMap, // literal -> clause index
+    decision: Vec<Var>,    // decision stack (trail), length is desision level
+    deduced: Vec<Var>,     // deduced literal trail (0 is for decision)
 }
 
 impl Solver {
@@ -169,7 +216,7 @@ impl Solver {
         }
 
         Solver {
-            assigns: vec![Assignment::UnDef; p.variables + 1],
+            assigns: Assignment::new(p.variables),
             db,
             clause_map,
             decision: Vec::with_capacity(p.variables),
@@ -186,11 +233,11 @@ impl Solver {
                         break;
                     }
                     self.cancel_clause(x);
-                    self.assigns[x] = Assignment::UnDef;
+                    self.assigns.set_undef(x as Lit);
                 }
                 if let Some(x) = self.decision.pop() {
                     self.cancel_clause(x);
-                    self.assigns[x].flip();
+                    self.assigns.flip(x as Lit);
                     self.update_clause(x);
                     self.deduced.push(x);
                 } else {
@@ -199,7 +246,8 @@ impl Solver {
             }
 
             if let Some((x, v)) = self.decide() {
-                self.assigns[x] = Assignment::Def(v);
+                let l = if v { x as Lit } else { -(x as Lit) };
+                self.assigns.set_pos(l);
                 self.update_clause(x); // x,-xを含んだ節の情報を更新する
                 self.deduced.push(0); // push dummy (decision)
                 self.decision.push(x);
@@ -211,9 +259,9 @@ impl Solver {
 
     // return selected var & assignment value
     fn decide(&mut self) -> Option<(Var, bool)> {
-        for (x, v) in self.assigns.iter().enumerate() {
-            if v == &Assignment::UnDef {
-                return Some((x, true));
+        for i in 1..=self.assigns.count() {
+            if self.assigns.is_undef(i as Lit) {
+                return Some((i, true));
             }
         }
         None
@@ -230,7 +278,7 @@ impl Solver {
                 }
                 if let Some(l) = c.is_unit(&self.assigns) {
                     let x = l.abs() as Var;
-                    self.assigns[x] = Assignment::Def(l > 0);
+                    self.assigns.set_pos(l);
                     self.update_clause(x);
                     self.deduced.push(x);
                 }
@@ -243,8 +291,9 @@ impl Solver {
 
     // update counter/watch list with clause containing x
     fn update_clause(&mut self, x: Var) {
-        if let Assignment::Def(v) = self.assigns[x] {
-            let l = if v { x as Lit } else { -(x as Lit) };
+        let l = x as Lit;
+        if self.assigns.is_def(l) {
+            let l = if self.assigns.value(l) { l } else { -l };
             for &idx in self.clause_map.get(l) {
                 self.db[idx].notice_pos(l, &self.assigns);
             }
@@ -256,8 +305,9 @@ impl Solver {
 
     // cancel counter/watch list with clause containing x
     fn cancel_clause(&mut self, x: Var) {
-        if let Assignment::Def(v) = self.assigns[x] {
-            let l = if v { x as Lit } else { -(x as Lit) };
+        let l = x as Lit;
+        if self.assigns.is_def(l) {
+            let l = if self.assigns.value(l) { l } else { -l };
             for &idx in self.clause_map.get(l) {
                 self.db[idx].notice_pos_to_undef(l, &self.assigns);
             }
@@ -273,8 +323,7 @@ fn bench1000(sat: bool, num: i32) {
     for i in 1..=1000 {
         let path = format!(
             "./bench/{0}{1}/{0}{1}-0{2}.cnf",
-            if sat { "uuf" } else { "uuf" },
-            //if sat { "uf" } else { "uuf" },
+            if sat { "uf" } else { "uuf" },
             num,
             i
         );
@@ -301,11 +350,6 @@ fn test_uf100() {
 #[test]
 fn test_uuf100() {
     bench1000(false, 100);
-}
-
-#[test]
-fn dummy_uf50() {
-    bench1000(true, 50)
 }
 
 fn solve(file_name: &str) -> bool {
