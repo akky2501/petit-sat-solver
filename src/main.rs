@@ -132,37 +132,50 @@ impl Assignment {
 #[derive(Debug)]
 struct Clause {
     lits: Vec<Lit>, // literals
-    pos: usize,     // number of literals assigned T
-    neg: usize,     // number of literals assigned F
+    wl: [usize; 2], // watched literal index
 }
 
 impl Clause {
-    fn notice_pos(&mut self, _: Lit, _: &Assignment) {
-        self.pos += 1;
-    }
-
-    fn notice_neg(&mut self, _: Lit, _: &Assignment) {
-        self.neg += 1;
-    }
-
-    fn notice_pos_to_undef(&mut self, _: Lit, _: &Assignment) {
-        self.pos -= 1;
-    }
-
-    fn notice_neg_to_undef(&mut self, _: Lit, _: &Assignment) {
-        self.neg -= 1;
-    }
-
-    fn is_unit(&self, assigns: &Assignment) -> Option<Lit> {
-        if self.pos == 0 && self.lits.len() - 1 == self.neg {
-            self.lits.iter().find(|&&l| assigns.is_undef(l)).cloned()
-        } else {
-            None
+    fn notice_neg(&mut self, lit: Lit, assigns: &Assignment) {
+        for i in 0..1 {
+            let n = self.lits.len();
+            let wl1 = self.wl[(i + 1) % 2];
+            let wl0 = &mut self.wl[i];
+            if lit == self.lits[*wl0] {
+                let mut new_wl = (*wl0 + 1) % n;
+                while new_wl != *wl0 {
+                    if new_wl != wl1
+                        && (assigns.is_undef(self.lits[new_wl]) || assigns.value(self.lits[new_wl]))
+                    {
+                        *wl0 = new_wl;
+                        break;
+                    }
+                    new_wl = (new_wl + 1) % n;
+                }
+                break;
+            }
         }
     }
 
-    fn is_conflict(&self, _: &Assignment) -> bool {
-        self.pos == 0 && self.lits.len() == self.neg
+    fn is_unit(&self, assigns: &Assignment) -> Option<Lit> {
+        let l1 = self.lits[self.wl[0]];
+        let l2 = self.lits[self.wl[1]];
+        let d1 = assigns.is_def(l1);
+        let d2 = assigns.is_def(l2);
+        match (d1, d2) {
+            (true, false) if assigns.value(l1) == false => Some(l2),
+            (false, true) if assigns.value(l2) == false => Some(l1),
+            _ => None,
+        }
+    }
+
+    fn is_conflict(&self, assigns: &Assignment) -> bool {
+        let l1 = self.lits[self.wl[0]];
+        let l2 = self.lits[self.wl[1]];
+        assigns.is_def(l1)
+            && assigns.is_def(l2)
+            && assigns.value(l1) == false
+            && assigns.value(l2) == false
     }
 }
 
@@ -213,8 +226,7 @@ impl Solver {
             .into_iter()
             .map(|x| Clause {
                 lits: x,
-                pos: 0,
-                neg: 0,
+                wl: [0, 1],
             })
             .collect::<Vec<_>>();
 
@@ -303,33 +315,20 @@ impl Solver {
     fn update_clause(&mut self, x: Var) {
         let l = x as Lit;
         if self.assigns.is_def(l) {
-            let l = if self.assigns.value(l) { l } else { -l };
-            for &idx in self.clause_map.get(l) {
-                self.db[idx].notice_pos(l, &self.assigns);
-            }
-            for &idx in self.clause_map.get(-l) {
-                self.db[idx].notice_neg(-l, &self.assigns);
+            let neglit = if self.assigns.value(l) { -l } else { l };
+            for &idx in self.clause_map.get(neglit) {
+                self.db[idx].notice_neg(neglit, &self.assigns);
             }
         }
     }
 
     // cancel counter/watch list with clause containing x
-    fn cancel_clause(&mut self, x: Var) {
-        let l = x as Lit;
-        if self.assigns.is_def(l) {
-            let l = if self.assigns.value(l) { l } else { -l };
-            for &idx in self.clause_map.get(l) {
-                self.db[idx].notice_pos_to_undef(l, &self.assigns);
-            }
-            for &idx in self.clause_map.get(-l) {
-                self.db[idx].notice_neg_to_undef(-l, &self.assigns);
-            }
-        }
+    fn cancel_clause(&mut self, _x: Var) {
+        // do nothing
     }
 }
 
 fn bench1000(sat: bool, num: i32) {
-    use std::fs::File;
     for i in 1..=1000 {
         let path = format!(
             "./bench/{0}{1}/{0}{1}-0{2}.cnf",
@@ -360,6 +359,55 @@ fn test_uf100() {
 #[test]
 fn test_uuf100() {
     bench1000(false, 100);
+}
+
+#[test]
+fn test_true() {
+    let problem = Problem {
+        variables: 4,
+        clause: vec![vec![1, 2], vec![-1, -2], vec![3, 4], vec![-3, 4]],
+    };
+    assert_eq!(Solver::new(problem).run(), true);
+}
+
+#[test]
+fn test2() {
+    let problem = Problem {
+        variables: 2,
+        clause: vec![vec![1, 2], vec![1, -2], vec![-1, -2]],
+    };
+    assert_eq!(Solver::new(problem).run(), true);
+}
+
+#[test]
+fn test3() {
+    let problem = Problem {
+        variables: 2,
+        clause: vec![vec![1, 2], vec![-1, 2], vec![1, -2], vec![-1, -2]],
+    };
+    assert_eq!(Solver::new(problem).run(), false);
+}
+#[test]
+fn test4() {
+    let problem = Problem {
+        variables: 6,
+        clause: vec![
+            vec![4, 5],
+            vec![-4, -5],
+            vec![1, 6],
+            vec![-1, -6],
+            vec![-2, -3],
+        ],
+    };
+    assert_eq!(Solver::new(problem).run(), true);
+}
+#[test]
+fn test5() {
+    let problem = Problem {
+        variables: 9,
+        clause: vec![vec![1, 6, 5, 4, 3, 9, 2]],
+    };
+    assert_eq!(Solver::new(problem).run(), true);
 }
 
 fn solve(file_name: &str) -> bool {
