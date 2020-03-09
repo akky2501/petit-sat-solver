@@ -273,8 +273,7 @@ fn bench1000(sat: bool, num: i32) {
     for i in 1..=1000 {
         let path = format!(
             "./bench/{0}{1}/{0}{1}-0{2}.cnf",
-            if sat { "uuf" } else { "uuf" },
-            //if sat { "uf" } else { "uuf" },
+            if sat { "uf" } else { "uuf" },
             num,
             i
         );
@@ -301,11 +300,6 @@ fn test_uf100() {
 #[test]
 fn test_uuf100() {
     bench1000(false, 100);
-}
-
-#[test]
-fn dummy_uf50() {
-    bench1000(true, 50)
 }
 
 fn solve(file_name: &str) -> bool {
