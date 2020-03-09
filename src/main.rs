@@ -133,15 +133,26 @@ impl Assignment {
 struct Clause {
     lits: Vec<Lit>, // literals
     wl: [usize; 2], // watched literal index
+    pos: usize,     // number of literals assigned T
+    neg: usize,     // number of literals assigned F
 }
 
 impl Clause {
+    fn notice_pos(&mut self, l: Lit, _: &Assignment) {
+        //println!("lits: {:?}, notice_pos: {:?}", self, l);
+        self.pos += 1;
+    }
     fn notice_neg(&mut self, lit: Lit, assigns: &Assignment) {
-        for i in 0..1 {
+        //println!("lits: {:?}, notice_neg: {:?}", self, lit);
+        self.neg += 1;
+
+        for i in 0..2 {
             let n = self.lits.len();
             let wl1 = self.wl[(i + 1) % 2];
             let wl0 = &mut self.wl[i];
+            //println!("lit({:?}), self.lits[*wl0]({:?})", lit, self.lits[*wl0]);
             if lit == self.lits[*wl0] {
+                //println!("PROCESS!!!!!!!!!!!!!");
                 let mut new_wl = (*wl0 + 1) % n;
                 while new_wl != *wl0 {
                     if new_wl != wl1
@@ -155,27 +166,69 @@ impl Clause {
                 break;
             }
         }
+        //println!("after: {:?}", self);
+    }
+    fn notice_pos_to_undef(&mut self, l: Lit, _: &Assignment) {
+        //println!("lits: {:?}, notice_pos_to_undef: {:?}", self, l);
+        self.pos -= 1;
+    }
+
+    fn notice_neg_to_undef(&mut self, l: Lit, _: &Assignment) {
+        //println!("lits: {:?}, notice_neg_to_undef: {:?}", self, l);
+        self.neg -= 1;
     }
 
     fn is_unit(&self, assigns: &Assignment) -> Option<Lit> {
-        let l1 = self.lits[self.wl[0]];
-        let l2 = self.lits[self.wl[1]];
-        let d1 = assigns.is_def(l1);
-        let d2 = assigns.is_def(l2);
-        match (d1, d2) {
-            (true, false) if assigns.value(l1) == false => Some(l2),
-            (false, true) if assigns.value(l2) == false => Some(l1),
-            _ => None,
+        //println!("lits: {:?}, is_unit", self);
+        let answer_a = {
+            if self.pos == 0 && self.lits.len() - 1 == self.neg {
+                self.lits.iter().find(|&&l| assigns.is_undef(l)).cloned()
+            } else {
+                None
+            }
+        };
+        let answer_b = {
+            let l1 = self.lits[self.wl[0]];
+            let l2 = self.lits[self.wl[1]];
+            let d1 = assigns.is_def(l1);
+            let d2 = assigns.is_def(l2);
+            match (d1, d2) {
+                (true, false) if assigns.value(l1) == false => Some(l2),
+                (false, true) if assigns.value(l2) == false => Some(l1),
+                _ => None,
+            }
+        };
+        if answer_a != answer_b {
+            let l1 = self.lits[self.wl[0]];
+            let l2 = self.lits[self.wl[1]];
+            let d1 = assigns.is_def(l1);
+            let d2 = assigns.is_def(l2);
+            println!("{:?}", assigns);
+            println!("l1({:?}), l2({:?}), d1({:?}), d2({:?})", l1, l2, d1, d2);
+            if d1 {
+                println!("<l1>({:?})", assigns.value(l1))
+            };
+            if d2 {
+                println!("<l2>({:?})", assigns.value(l2))
+            };
         }
+        assert_eq!(answer_a, answer_b);
+        answer_a
     }
 
     fn is_conflict(&self, assigns: &Assignment) -> bool {
-        let l1 = self.lits[self.wl[0]];
-        let l2 = self.lits[self.wl[1]];
-        assigns.is_def(l1)
-            && assigns.is_def(l2)
-            && assigns.value(l1) == false
-            && assigns.value(l2) == false
+        //println!("lits: {:?}, is_conflict", self);
+        let answer_a = { self.pos == 0 && self.lits.len() == self.neg };
+        let answer_b = {
+            let l1 = self.lits[self.wl[0]];
+            let l2 = self.lits[self.wl[1]];
+            assigns.is_def(l1)
+                && assigns.is_def(l2)
+                && assigns.value(l1) == false
+                && assigns.value(l2) == false
+        };
+        assert_eq!(answer_a, answer_b);
+        answer_a
     }
 }
 
@@ -227,6 +280,8 @@ impl Solver {
             .map(|x| Clause {
                 lits: x,
                 wl: [0, 1],
+                pos: 0,
+                neg: 0,
             })
             .collect::<Vec<_>>();
 
@@ -311,7 +366,7 @@ impl Solver {
         }
     }
 
-    // update counter/watch list with clause containing x
+    /* // update counter/watch list with clause containing x
     fn update_clause(&mut self, x: Var) {
         let l = x as Lit;
         if self.assigns.is_def(l) {
@@ -325,6 +380,31 @@ impl Solver {
     // cancel counter/watch list with clause containing x
     fn cancel_clause(&mut self, _x: Var) {
         // do nothing
+    }*/
+    fn update_clause(&mut self, x: Var) {
+        let l = x as Lit;
+        if self.assigns.is_def(l) {
+            let l = if self.assigns.value(l) { l } else { -l };
+            for &idx in self.clause_map.get(l) {
+                self.db[idx].notice_pos(l, &self.assigns);
+            }
+            for &idx in self.clause_map.get(-l) {
+                self.db[idx].notice_neg(-l, &self.assigns);
+            }
+        }
+    }
+
+    fn cancel_clause(&mut self, x: Var) {
+        let l = x as Lit;
+        if self.assigns.is_def(l) {
+            let l = if self.assigns.value(l) { l } else { -l };
+            for &idx in self.clause_map.get(l) {
+                self.db[idx].notice_pos_to_undef(l, &self.assigns);
+            }
+            for &idx in self.clause_map.get(-l) {
+                self.db[idx].notice_neg_to_undef(-l, &self.assigns);
+            }
+        }
     }
 }
 
@@ -339,6 +419,11 @@ fn bench1000(sat: bool, num: i32) {
         println!("solving... {}", path);
         assert_eq!(solve(&path), sat, "wrong answer at {}.", i);
     }
+}
+
+#[test]
+fn test_uf20() {
+    bench1000(true, 20);
 }
 
 #[test]
