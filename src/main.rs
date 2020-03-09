@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::{env, fs};
 
 struct Problem {
@@ -131,36 +132,34 @@ impl Assignment {
 
 #[derive(Debug)]
 struct Clause {
-    lits: Vec<Lit>, // literals
-    wl: [usize; 2], // watched literal index
+    lits: Vec<Lit>, // literals ([0], [1] are watched literals)
 }
 
 impl Clause {
     fn notice_neg(&mut self, lit: Lit, assigns: &Assignment) -> Lit {
-        for i in 0..2 {
-            let n = self.lits.len();
-            let wl1 = self.wl[(i + 1) % 2];
-            let wl0 = &mut self.wl[i];
-            if lit == self.lits[*wl0] {
-                let mut new_wl = (*wl0 + 1) % n;
-                while new_wl != *wl0 {
-                    if new_wl != wl1
-                        && (assigns.is_undef(self.lits[new_wl]) || assigns.value(self.lits[new_wl]))
-                    {
-                        *wl0 = new_wl;
-                        break;
-                    }
-                    new_wl = (new_wl + 1) % n;
-                }
-                return self.lits[*wl0]; // return new watched literal
+        if self.lits[1] == lit {
+            // swap
+            let t = self.lits[0];
+            self.lits[0] = self.lits[1];
+            self.lits[1] = t;
+        }
+        let mut new_wl = 0;
+        for i in 2..self.lits.len() {
+            if assigns.is_undef(self.lits[i]) || assigns.value(self.lits[i]) {
+                new_wl = i;
+                break;
             }
         }
-        unreachable!()
+        // swap
+        let t = self.lits[0];
+        self.lits[0] = self.lits[new_wl];
+        self.lits[new_wl] = t;
+        self.lits[0] // return new watched literal
     }
 
     fn is_unit(&self, assigns: &Assignment) -> Option<Lit> {
-        let l1 = self.lits[self.wl[0]];
-        let l2 = self.lits[self.wl[1]];
+        let l1 = self.lits[0];
+        let l2 = self.lits[1];
         let d1 = assigns.is_def(l1);
         let d2 = assigns.is_def(l2);
         match (d1, d2) {
@@ -171,8 +170,8 @@ impl Clause {
     }
 
     fn is_conflict(&self, assigns: &Assignment) -> bool {
-        let l1 = self.lits[self.wl[0]];
-        let l2 = self.lits[self.wl[1]];
+        let l1 = self.lits[0];
+        let l2 = self.lits[1];
         assigns.is_def(l1)
             && assigns.is_def(l2)
             && assigns.value(l1) == false
@@ -181,20 +180,19 @@ impl Clause {
 }
 
 #[derive(Debug)]
-// TODO: try HashMap
 struct ClauseMap {
-    pos_map: Vec<Vec<usize>>,
-    neg_map: Vec<Vec<usize>>,
+    pos_map: Vec<HashSet<usize>>,
+    neg_map: Vec<HashSet<usize>>,
 }
 
 impl ClauseMap {
     fn new(n: usize) -> ClauseMap {
-        let pos_map = vec![vec![]; n + 1];
-        let neg_map = vec![vec![]; n + 1];
+        let pos_map = vec![HashSet::new(); n + 1];
+        let neg_map = vec![HashSet::new(); n + 1];
         ClauseMap { pos_map, neg_map }
     }
 
-    fn get(&self, l: Lit) -> &Vec<usize> {
+    fn get(&self, l: Lit) -> &HashSet<usize> {
         if l > 0 {
             &self.pos_map[l as usize]
         } else {
@@ -204,9 +202,9 @@ impl ClauseMap {
 
     fn insert(&mut self, l: Lit, c: usize) {
         if l > 0 {
-            self.pos_map[l as usize].push(c);
+            self.pos_map[l as usize].insert(c);
         } else {
-            self.neg_map[-l as usize].push(c);
+            self.neg_map[-l as usize].insert(c);
         }
     }
 
@@ -217,12 +215,7 @@ impl ClauseMap {
             &mut self.neg_map[-l as usize]
         };
 
-        for i in 0..map.len() {
-            if map[i] == c {
-                map.swap_remove(i);
-                return;
-            }
-        }
+        map.remove(&c);
     }
 }
 
@@ -233,6 +226,9 @@ struct Solver {
     clause_map: ClauseMap, // literal -> clause index
     decision: Vec<Var>,    // decision stack (trail), length is desision level
     deduced: Vec<Var>,     // deduced literal trail (0 is for decision)
+
+    delete_list: Vec<usize>,
+    insert_list: Vec<i64>,
 }
 
 impl Solver {
@@ -241,10 +237,7 @@ impl Solver {
         let db = p
             .clause
             .into_iter()
-            .map(|x| Clause {
-                lits: x,
-                wl: [0, 1],
-            })
+            .map(|x| Clause { lits: x })
             .collect::<Vec<_>>();
 
         let mut clause_map = ClauseMap::new(p.variables);
@@ -253,46 +246,56 @@ impl Solver {
             clause_map.insert(c.lits[1], idx);
         }
 
+        let clen = db.len();
         Solver {
             assigns: Assignment::new(p.variables),
             db,
             clause_map,
             decision: Vec::with_capacity(p.variables),
             deduced: Vec::with_capacity(p.variables),
+
+            delete_list: Vec::with_capacity(clen),
+            insert_list: Vec::with_capacity(clen),
         }
     }
 
     fn run(&mut self) -> bool {
         loop {
             while let Some(_conflict) = self.bcp() {
-                // DPLL
-                while let Some(x) = self.deduced.pop() {
-                    if x == 0 {
-                        break;
-                    }
-                    self.cancel_clause(x);
-                    self.assigns.set_undef(x as Lit);
-                }
-                if let Some(x) = self.decision.pop() {
-                    self.cancel_clause(x);
-                    self.assigns.flip(x as Lit);
-                    self.update_clause(x);
-                    self.deduced.push(x);
-                } else {
-                    return false; // UNSAT
+                if !self.resolve_conflict_dpll() {
+                    return false;
                 }
             }
 
             if let Some((x, v)) = self.decide() {
                 let l = if v { x as Lit } else { -(x as Lit) };
                 self.assigns.set_pos(l);
-                self.update_clause(x); // x,-xを含んだ節の情報を更新する
+                self.update_clause(x);
                 self.deduced.push(0); // push dummy (decision)
                 self.decision.push(x);
             } else {
                 return true; // SAT
             }
         }
+    }
+
+    fn resolve_conflict_dpll(&mut self) -> bool {
+        while let Some(x) = self.deduced.pop() {
+            if x == 0 {
+                break;
+            }
+            self.cancel_clause(x);
+            self.assigns.set_undef(x as Lit);
+        }
+        if let Some(x) = self.decision.pop() {
+            self.cancel_clause(x);
+            self.assigns.flip(x as Lit);
+            self.update_clause(x);
+            self.deduced.push(x);
+        } else {
+            return false; // UNSAT
+        }
+        true
     }
 
     // return selected var & assignment value
@@ -332,14 +335,16 @@ impl Solver {
         let l = x as Lit;
         if self.assigns.is_def(l) {
             let neglit = if self.assigns.value(l) { -l } else { l };
-            let mut delete_list = vec![];
-            let mut insert_list = vec![];
+            self.delete_list.clear();
+            self.insert_list.clear();
             for &idx in self.clause_map.get(neglit) {
                 let new_wl = self.db[idx].notice_neg(neglit, &self.assigns);
-                delete_list.push(idx); // unwatch clause
-                insert_list.push(new_wl); // watch new clause
+                if new_wl != neglit {
+                    self.delete_list.push(idx); // unwatch clause
+                    self.insert_list.push(new_wl); // watch new clause
+                }
             }
-            for (idx, new_wl) in delete_list.into_iter().zip(insert_list.into_iter()) {
+            for (&idx, &new_wl) in self.delete_list.iter().zip(self.insert_list.iter()) {
                 self.clause_map.delete(neglit, idx);
                 self.clause_map.insert(new_wl, idx);
             }
