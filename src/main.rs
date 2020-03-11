@@ -1,4 +1,6 @@
-use std::collections::HashSet;
+extern crate fxhash;
+use fxhash::FxHashSet;
+use std::ops::Index;
 use std::{env, fs};
 
 struct Problem {
@@ -63,70 +65,80 @@ enum AssignmentCell {
 
 #[derive(Debug)]
 struct Assignment {
+    base: Lit,
     values: Vec<AssignmentCell>,
 }
 
 impl Assignment {
     fn new(n: usize) -> Self {
         Assignment {
-            values: vec![AssignmentCell::UnDef; n + 1],
+            base: n as Lit,
+            values: vec![AssignmentCell::UnDef; 2 * n + 1],
         }
     }
 
     #[inline]
     fn count(&self) -> usize {
-        self.values.len() - 1
+        self.base as usize
     }
 
     #[inline]
-    fn def_idx(&self, l: Lit) -> Var {
-        l.abs() as Var
+    fn idx(&self, l: Lit) -> Var {
+        (self.base + l) as Var
     }
 
     #[inline]
     fn set_pos(&mut self, l: Lit) {
-        let x = self.def_idx(l);
-        self.values[x] = AssignmentCell::Def(l > 0);
+        let p = self.idx(l);
+        let n = self.idx(-l);
+        self.values[p] = AssignmentCell::Def(true);
+        self.values[n] = AssignmentCell::Def(false);
     }
 
     #[inline]
     fn flip(&mut self, l: Lit) {
-        let x = self.def_idx(l);
-        if let AssignmentCell::Def(ref mut b) = self.values[x] {
-            *b = !*b;
-        }
+        let p = self.idx(l);
+        let n = self.idx(-l);
+        self.values.swap(p, n);
     }
 
     #[inline]
     fn set_undef(&mut self, l: Lit) {
-        let x = self.def_idx(l);
-        self.values[x] = AssignmentCell::UnDef;
+        let p = self.idx(l);
+        let n = self.idx(-l);
+        self.values[p] = AssignmentCell::UnDef;
+        self.values[n] = AssignmentCell::UnDef;
     }
 
     #[inline]
     fn value(&self, l: Lit) -> bool {
-        let x = self.def_idx(l);
-        match self.values[x] {
-            AssignmentCell::Def(b) => {
-                if l > 0 {
-                    b
-                } else {
-                    !b
-                }
-            }
+        match self.values[self.idx(l)] {
+            AssignmentCell::Def(b) => b,
             _ => unreachable!(),
         }
     }
 
     #[inline]
     fn is_def(&self, l: Lit) -> bool {
-        let x = self.def_idx(l);
-        self.values[x] != AssignmentCell::UnDef
+        match self.values[self.idx(l)] {
+            AssignmentCell::Def(_) => true,
+            _ => false,
+        }
     }
 
     #[inline]
     fn is_undef(&self, l: Lit) -> bool {
         !self.is_def(l)
+    }
+}
+
+impl Index<Lit> for Assignment {
+    type Output = AssignmentCell;
+
+    #[inline]
+    fn index(&self, l: Lit) -> &AssignmentCell {
+        let l = self.idx(l);
+        &self.values[l]
     }
 }
 
@@ -138,84 +150,77 @@ struct Clause {
 impl Clause {
     fn notice_neg(&mut self, lit: Lit, assigns: &Assignment) -> Lit {
         if self.lits[1] == lit {
-            // swap
-            let t = self.lits[0];
-            self.lits[0] = self.lits[1];
-            self.lits[1] = t;
+            self.lits.swap(0, 1);
         }
         let mut new_wl = 0;
         for i in 2..self.lits.len() {
-            if assigns.is_undef(self.lits[i]) || assigns.value(self.lits[i]) {
-                new_wl = i;
-                break;
+            match assigns[self.lits[i]] {
+                AssignmentCell::Def(false) => (),
+                _ => {
+                    new_wl = i;
+                    break;
+                }
             }
         }
-        // swap
-        let t = self.lits[0];
-        self.lits[0] = self.lits[new_wl];
-        self.lits[new_wl] = t;
+        self.lits.swap(0, new_wl);
         self.lits[0] // return new watched literal
     }
 
     fn is_unit(&self, assigns: &Assignment) -> Option<Lit> {
+        use AssignmentCell::*;
         let l1 = self.lits[0];
         let l2 = self.lits[1];
-        let d1 = assigns.is_def(l1);
-        let d2 = assigns.is_def(l2);
-        match (d1, d2) {
-            (true, false) if assigns.value(l1) == false => Some(l2),
-            (false, true) if assigns.value(l2) == false => Some(l1),
+        match (assigns[l1], assigns[l2]) {
+            (Def(false), UnDef) => Some(l2),
+            (UnDef, Def(false)) => Some(l1),
             _ => None,
         }
     }
 
     fn is_conflict(&self, assigns: &Assignment) -> bool {
+        use AssignmentCell::*;
         let l1 = self.lits[0];
         let l2 = self.lits[1];
-        assigns.is_def(l1)
-            && assigns.is_def(l2)
-            && assigns.value(l1) == false
-            && assigns.value(l2) == false
+        match (assigns[l1], assigns[l2]) {
+            (Def(false), Def(false)) => true,
+            _ => false,
+        }
     }
 }
 
 #[derive(Debug)]
 struct ClauseMap {
-    pos_map: Vec<HashSet<usize>>,
-    neg_map: Vec<HashSet<usize>>,
+    base: Lit,
+    map: Vec<FxHashSet<usize>>,
 }
 
 impl ClauseMap {
     fn new(n: usize) -> ClauseMap {
-        let pos_map = vec![HashSet::new(); n + 1];
-        let neg_map = vec![HashSet::new(); n + 1];
-        ClauseMap { pos_map, neg_map }
+        let map = vec![FxHashSet::default(); 2 * n + 1];
+        ClauseMap {
+            base: n as Lit,
+            map,
+        }
     }
 
-    fn get(&self, l: Lit) -> &HashSet<usize> {
-        if l > 0 {
-            &self.pos_map[l as usize]
-        } else {
-            &self.neg_map[-l as usize]
-        }
+    #[inline]
+    fn idx(&self, l: Lit) -> Var {
+        (self.base + l) as Var
+    }
+
+    fn get(&self, l: Lit) -> &FxHashSet<usize> {
+        let l = self.idx(l);
+        &self.map[l]
     }
 
     fn insert(&mut self, l: Lit, c: usize) {
-        if l > 0 {
-            self.pos_map[l as usize].insert(c);
-        } else {
-            self.neg_map[-l as usize].insert(c);
-        }
+        let l = self.idx(l);
+        self.map[l as usize].insert(c);
     }
 
     fn delete(&mut self, l: Lit, c: usize) {
-        let map = if l > 0 {
-            &mut self.pos_map[l as usize]
-        } else {
-            &mut self.neg_map[-l as usize]
-        };
-
-        map.remove(&c);
+        let l = self.idx(l);
+        self.map[l].remove(&c);
     }
 }
 
