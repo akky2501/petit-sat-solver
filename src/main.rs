@@ -1,11 +1,13 @@
-extern crate fxhash;
-use fxhash::FxHashSet;
-use std::ops::Index;
+use std::fmt;
+use std::ops::{Index, IndexMut};
 use std::{env, fs};
+
+type Var = u32;
+type Lit = i32;
 
 struct Problem {
     variables: usize,
-    clause: Vec<Vec<i64>>,
+    clause: Vec<Vec<Lit>>,
 }
 
 fn parse_dimacs(text: &str) -> Result<Problem, ()> {
@@ -30,16 +32,16 @@ fn parse_dimacs(text: &str) -> Result<Problem, ()> {
         }
     };
 
-    let mut cs = vec![];
+    let mut clause = vec![];
     for _ in 0..cnum {
         if let Some(l) = lines.next() {
             let mut c = l
                 .split_whitespace()
                 .map(|s| s.parse().unwrap())
-                .collect::<Vec<i64>>();
+                .collect::<Vec<Lit>>();
             if let Some(0) = c.pop() {
                 // consume 0
-                cs.push(c);
+                clause.push(c);
             } else {
                 return Err(());
             }
@@ -50,12 +52,57 @@ fn parse_dimacs(text: &str) -> Result<Problem, ()> {
 
     Ok(Problem {
         variables: vnum,
-        clause: cs,
+        clause,
     })
 }
 
-type Var = usize;
-type Lit = i64;
+struct LitArray<T> {
+    base: Lit,
+    values: Vec<T>,
+}
+
+impl<T: Default + Clone> LitArray<T> {
+    fn new(n: usize) -> Self {
+        LitArray {
+            base: n as Lit,
+            values: vec![T::default(); 2 * n + 1],
+        }
+    }
+}
+
+impl<T> LitArray<T> {
+    #[inline]
+    fn idx(&self, l: Lit) -> usize {
+        (self.base + l) as usize
+    }
+}
+
+impl<T> Index<Lit> for LitArray<T> {
+    type Output = T;
+
+    #[inline]
+    fn index(&self, l: Lit) -> &Self::Output {
+        let l = self.idx(l);
+        &self.values[l]
+    }
+}
+
+impl<T> IndexMut<Lit> for LitArray<T> {
+    #[inline]
+    fn index_mut(&mut self, l: Lit) -> &mut Self::Output {
+        let l = self.idx(l);
+        &mut self.values[l]
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for LitArray<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LitArray")
+            .field("base", &self.base)
+            .field("values", &self.values)
+            .finish()
+    }
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum AssignmentCell {
@@ -63,72 +110,50 @@ enum AssignmentCell {
     Def(bool),
 }
 
+impl AssignmentCell {
+    fn is_undef(&self) -> bool {
+        match self {
+            AssignmentCell::UnDef => true,
+            _ => false,
+        }
+    }
+}
+
+impl Default for AssignmentCell {
+    fn default() -> Self {
+        AssignmentCell::UnDef
+    }
+}
+
 #[derive(Debug)]
 struct Assignment {
-    base: Lit,
-    values: Vec<AssignmentCell>,
+    n: usize,
+    values: LitArray<AssignmentCell>,
 }
 
 impl Assignment {
     fn new(n: usize) -> Self {
         Assignment {
-            base: n as Lit,
-            values: vec![AssignmentCell::UnDef; 2 * n + 1],
+            n,
+            values: LitArray::new(n),
         }
     }
 
     #[inline]
     fn count(&self) -> usize {
-        self.base as usize
+        self.n
     }
 
     #[inline]
-    fn idx(&self, l: Lit) -> Var {
-        (self.base + l) as Var
-    }
-
-    #[inline]
-    fn set_pos(&mut self, l: Lit) {
-        let p = self.idx(l);
-        let n = self.idx(-l);
-        self.values[p] = AssignmentCell::Def(true);
-        self.values[n] = AssignmentCell::Def(false);
-    }
-
-    #[inline]
-    fn flip(&mut self, l: Lit) {
-        let p = self.idx(l);
-        let n = self.idx(-l);
-        self.values.swap(p, n);
+    fn set_negative(&mut self, l: Lit) {
+        self.values[l] = AssignmentCell::Def(false);
+        self.values[-l] = AssignmentCell::Def(true);
     }
 
     #[inline]
     fn set_undef(&mut self, l: Lit) {
-        let p = self.idx(l);
-        let n = self.idx(-l);
-        self.values[p] = AssignmentCell::UnDef;
-        self.values[n] = AssignmentCell::UnDef;
-    }
-
-    #[inline]
-    fn value(&self, l: Lit) -> bool {
-        match self.values[self.idx(l)] {
-            AssignmentCell::Def(b) => b,
-            _ => unreachable!(),
-        }
-    }
-
-    #[inline]
-    fn is_def(&self, l: Lit) -> bool {
-        match self.values[self.idx(l)] {
-            AssignmentCell::Def(_) => true,
-            _ => false,
-        }
-    }
-
-    #[inline]
-    fn is_undef(&self, l: Lit) -> bool {
-        !self.is_def(l)
+        self.values[l] = AssignmentCell::UnDef;
+        self.values[-l] = AssignmentCell::UnDef;
     }
 }
 
@@ -137,9 +162,16 @@ impl Index<Lit> for Assignment {
 
     #[inline]
     fn index(&self, l: Lit) -> &AssignmentCell {
-        let l = self.idx(l);
         &self.values[l]
     }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ClauseState {
+    Implied(Lit),
+    Satisfied,
+    Conflict,
+    Otherwise(Lit),
 }
 
 #[derive(Debug)]
@@ -148,80 +180,65 @@ struct Clause {
 }
 
 impl Clause {
-    fn notice_neg(&mut self, lit: Lit, assigns: &Assignment) -> Lit {
+    fn notice_negative(&mut self, lit: Lit, assigns: &Assignment) -> ClauseState {
+        assert_eq!(AssignmentCell::Def(false), assigns[lit]);
         if self.lits[1] == lit {
             self.lits.swap(0, 1);
         }
-        let mut new_wl = 0;
+        if assigns[self.lits[1]] == AssignmentCell::Def(true) {
+            return ClauseState::Satisfied; // already sat
+        }
+        // assigns[lits[1]] is undef or false
         for i in 2..self.lits.len() {
             match assigns[self.lits[i]] {
                 AssignmentCell::Def(false) => (),
                 _ => {
-                    new_wl = i;
-                    break;
+                    self.lits.swap(0, i);
+                    return ClauseState::Otherwise(self.lits[0]);
                 }
             }
         }
-        self.lits.swap(0, new_wl);
-        self.lits[0] // return new watched literal
-    }
-
-    fn is_unit(&self, assigns: &Assignment) -> Option<Lit> {
-        use AssignmentCell::*;
-        let l1 = self.lits[0];
-        let l2 = self.lits[1];
-        match (assigns[l1], assigns[l2]) {
-            (Def(false), UnDef) => Some(l2),
-            (UnDef, Def(false)) => Some(l1),
-            _ => None,
+        // assigns[lits[0]] is false
+        if assigns[self.lits[1]] == AssignmentCell::Def(false) {
+            ClauseState::Conflict
+        } else {
+            ClauseState::Implied(self.lits[1])
         }
     }
 
-    fn is_conflict(&self, assigns: &Assignment) -> bool {
-        use AssignmentCell::*;
-        let l1 = self.lits[0];
-        let l2 = self.lits[1];
-        match (assigns[l1], assigns[l2]) {
-            (Def(false), Def(false)) => true,
+    fn is_all_false(&self, assigns: &Assignment) -> bool {
+        self.lits.iter().all(|&l| match &assigns[l] {
+            AssignmentCell::Def(false) => true,
             _ => false,
-        }
+        })
     }
 }
 
 #[derive(Debug)]
 struct ClauseMap {
-    base: Lit,
-    map: Vec<FxHashSet<usize>>,
+    map: LitArray<Vec<usize>>,
 }
 
 impl ClauseMap {
     fn new(n: usize) -> ClauseMap {
-        let map = vec![FxHashSet::default(); 2 * n + 1];
         ClauseMap {
-            base: n as Lit,
-            map,
+            map: LitArray::new(n),
         }
     }
 
-    #[inline]
-    fn idx(&self, l: Lit) -> Var {
-        (self.base + l) as Var
-    }
-
-    fn get(&self, l: Lit) -> &FxHashSet<usize> {
-        let l = self.idx(l);
-        &self.map[l]
+    fn swap_list(&mut self, l: Lit, list: &mut Vec<usize>) {
+        std::mem::swap(list, &mut self.map[l]);
     }
 
     fn insert(&mut self, l: Lit, c: usize) {
-        let l = self.idx(l);
-        self.map[l as usize].insert(c);
+        self.map[l].push(c);
     }
+}
 
-    fn delete(&mut self, l: Lit, c: usize) {
-        let l = self.idx(l);
-        self.map[l].remove(&c);
-    }
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum Step {
+    Decided(Lit),
+    Deduced(Lit),
 }
 
 #[derive(Debug)]
@@ -229,11 +246,8 @@ struct Solver {
     assigns: Assignment,   // assigns of variables
     db: Vec<Clause>,       // clause data base
     clause_map: ClauseMap, // literal -> clause index
-    decision: Vec<Var>,    // decision stack (trail), length is desision level
-    deduced: Vec<Var>,     // deduced literal trail (0 is for decision)
-
-    delete_list: Vec<usize>,
-    insert_list: Vec<i64>,
+    trail: Vec<Step>,      // decision/deduced trail
+    propagated: usize,     // how many literals propagated ?
 }
 
 impl Solver {
@@ -250,115 +264,102 @@ impl Solver {
             clause_map.insert(c.lits[0], idx); // watch literal/clause
             clause_map.insert(c.lits[1], idx);
         }
-
-        let clen = db.len();
         Solver {
             assigns: Assignment::new(p.variables),
             db,
             clause_map,
-            decision: Vec::with_capacity(p.variables),
-            deduced: Vec::with_capacity(p.variables),
-
-            delete_list: Vec::with_capacity(clen),
-            insert_list: Vec::with_capacity(clen),
+            trail: Vec::with_capacity(p.variables),
+            propagated: 0,
         }
     }
 
     fn run(&mut self) -> bool {
         loop {
-            while let Some(_conflict) = self.bcp() {
-                if !self.resolve_conflict_dpll() {
-                    return false;
+            while let Some(conflict) = self.bcp() {
+                if !self.resolve_conflict_cdcl(conflict) {
+                    return false; // UNSAT
                 }
             }
 
-            if let Some((x, v)) = self.decide() {
-                let l = if v { x as Lit } else { -(x as Lit) };
-                self.assigns.set_pos(l);
-                self.update_clause(x);
-                self.deduced.push(0); // push dummy (decision)
-                self.decision.push(x);
+            if let Some(l) = self.decide() {
+                self.assigns.set_negative(l);
+                self.trail.push(Step::Decided(l));
             } else {
+                //assert!(self.db.iter().all(|c| !c.is_all_false(&self.assigns)));
                 return true; // SAT
             }
         }
     }
 
     fn resolve_conflict_dpll(&mut self) -> bool {
-        while let Some(x) = self.deduced.pop() {
-            if x == 0 {
-                break;
+        while let Some(step) = self.trail.pop() {
+            match step {
+                Step::Deduced(l) => self.assigns.set_undef(l),
+                Step::Decided(l) => {
+                    self.propagated = self.trail.len(); // set back propagate level
+                    self.assigns.set_negative(-l);
+                    self.trail.push(Step::Deduced(-l));
+                    return true;
+                }
             }
-            self.cancel_clause(x);
-            self.assigns.set_undef(x as Lit);
         }
-        if let Some(x) = self.decision.pop() {
-            self.cancel_clause(x);
-            self.assigns.flip(x as Lit);
-            self.update_clause(x);
-            self.deduced.push(x);
-        } else {
-            return false; // UNSAT
-        }
-        true
+        false // UNSAT
     }
 
-    // return selected var & assignment value
-    fn decide(&mut self) -> Option<(Var, bool)> {
+    fn resolve_conflict_cdcl(&mut self, conflict: usize) -> bool {
+        self.resolve_conflict_dpll()
+    }
+
+    // return selected literal which assigned false
+    fn decide(&mut self) -> Option<Lit> {
         for i in 1..=self.assigns.count() {
-            if self.assigns.is_undef(i as Lit) {
-                return Some((i, true));
+            let l = i as Lit;
+            if self.assigns[l].is_undef() {
+                return Some(-l);
             }
         }
         None
     }
 
+    // boolean constraint propagation
     // return conflicting clause index
     fn bcp(&mut self) -> Option<usize> {
-        loop {
-            let last_len = self.deduced.len();
-            for idx in 0..self.db.len() {
-                let c = &self.db[idx];
-                if c.is_conflict(&self.assigns) {
-                    return Some(idx);
-                }
-                if let Some(l) = c.is_unit(&self.assigns) {
-                    let x = l.abs() as Var;
-                    self.assigns.set_pos(l);
-                    self.update_clause(x);
-                    self.deduced.push(x);
-                }
-            }
-            if last_len == self.deduced.len() {
-                return None;
-            }
-        }
-    }
+        use ClauseState::*;
+        let mut clause_list = Vec::with_capacity(0);
+        while self.propagated < self.trail.len() {
+            // get literal assigned false
+            let l = match self.trail[self.propagated] {
+                Step::Decided(l) | Step::Deduced(l) => l,
+            };
 
-    // update counter/watch list with clause containing x
-    fn update_clause(&mut self, x: Var) {
-        let l = x as Lit;
-        if self.assigns.is_def(l) {
-            let neglit = if self.assigns.value(l) { -l } else { l };
-            self.delete_list.clear();
-            self.insert_list.clear();
-            for &idx in self.clause_map.get(neglit) {
-                let new_wl = self.db[idx].notice_neg(neglit, &self.assigns);
-                if new_wl != neglit {
-                    self.delete_list.push(idx); // unwatch clause
-                    self.insert_list.push(new_wl); // watch new clause
-                }
-            }
-            for (&idx, &new_wl) in self.delete_list.iter().zip(self.insert_list.iter()) {
-                self.clause_map.delete(neglit, idx);
-                self.clause_map.insert(new_wl, idx);
-            }
-        }
-    }
+            self.propagated += 1; // modify propagated level
 
-    // cancel counter/watch list with clause containing x
-    fn cancel_clause(&mut self, _x: Var) {
-        // do nothing
+            self.clause_map.swap_list(l, &mut clause_list); // reset/get clause list watched l
+            let mut i = 0;
+            while i < clause_list.len() as i64 {
+                let idx = clause_list[i as usize];
+                match self.db[idx].notice_negative(l, &self.assigns) {
+                    Implied(unit) => {
+                        self.assigns.set_negative(-unit);
+                        self.trail.push(Step::Deduced(-unit));
+                    }
+                    Satisfied => (),
+                    Conflict => {
+                        self.clause_map.swap_list(l, &mut clause_list);
+                        return Some(idx);
+                    }
+                    Otherwise(new_wl) => {
+                        assert_ne!(l, new_wl);
+                        self.clause_map.insert(new_wl, idx);
+                        clause_list.swap_remove(i as usize);
+                        i -= 1;
+                    }
+                }
+                i += 1;
+            }
+            self.clause_map.swap_list(l, &mut clause_list);
+        }
+        None
     }
 }
 
@@ -371,7 +372,7 @@ fn bench1000(sat: bool, num: i32) {
             i
         );
         println!("solving... {}", path);
-        assert_eq!(solve(&path), sat, "wrong answer at {}.", i);
+        assert_eq!(sat, solve(&path), "wrong answer at {}.", path);
     }
 }
 
@@ -407,6 +408,48 @@ fn test_true() {
         clause: vec![vec![1, 2], vec![-1, -2], vec![3, 4], vec![-3, 4]],
     };
     assert_eq!(Solver::new(problem).run(), true);
+}
+
+#[test]
+fn test_false() {
+    let problem = Problem {
+        variables: 2,
+        clause: vec![vec![1, 2], vec![1, -2], vec![-1, 2], vec![-1, -2]],
+    };
+    assert_eq!(Solver::new(problem).run(), false);
+}
+
+#[test]
+fn test_false2() {
+    let problem = Problem {
+        variables: 3,
+        clause: vec![
+            vec![1, 2, 3],
+            vec![1, 2, -3],
+            vec![1, -2, 3],
+            vec![1, -2, -3],
+            vec![-1, 2, 3],
+            vec![-1, 2, -3],
+            vec![-1, -2, 3],
+            vec![-1, -2, -3],
+        ],
+    };
+    assert_eq!(Solver::new(problem).run(), false);
+}
+
+#[test]
+fn test_false3() {
+    let src = "p cnf 4 8
+    1  2 -3 0
+   -1 -2  3 0
+    2  3 -4 0
+   -2 -3  4 0
+    1  3  4 0
+   -1 -3 -4 0
+   -1  2  4 0
+    1 -2 -4 0";
+    let p = parse_dimacs(src).unwrap();
+    assert_eq!(false, Solver::new(p).run());
 }
 
 #[test]
