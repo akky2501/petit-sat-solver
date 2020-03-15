@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fmt;
 use std::ops::{Index, IndexMut};
 use std::{env, fs};
@@ -161,7 +162,7 @@ impl Index<Lit> for Assignment {
     type Output = AssignmentCell;
 
     #[inline]
-    fn index(&self, l: Lit) -> &AssignmentCell {
+    fn index(&self, l: Lit) -> &Self::Output {
         &self.values[l]
     }
 }
@@ -180,6 +181,14 @@ struct Clause {
 }
 
 impl Clause {
+    fn new(lits: Vec<Lit>) -> Self {
+        Clause { lits }
+    }
+
+    fn len(&self) -> usize {
+        self.lits.len()
+    }
+
     fn notice_negative(&mut self, lit: Lit, assigns: &Assignment) -> ClauseState {
         assert_eq!(AssignmentCell::Def(false), assigns[lit]);
         if self.lits[1] == lit {
@@ -214,6 +223,15 @@ impl Clause {
     }
 }
 
+impl Index<usize> for Clause {
+    type Output = Lit;
+
+    #[inline]
+    fn index(&self, i: usize) -> &Self::Output {
+        &self.lits[i]
+    }
+}
+
 #[derive(Debug)]
 struct ClauseMap {
     map: LitArray<Vec<usize>>,
@@ -241,13 +259,26 @@ enum Step {
     Deduced(Lit),
 }
 
+impl Step {
+    fn literal(&self) -> Lit {
+        match self {
+            Step::Decided(l) => *l,
+            Step::Deduced(l) => *l,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Solver {
     assigns: Assignment,   // assigns of variables
     db: Vec<Clause>,       // clause data base
     clause_map: ClauseMap, // literal -> clause index
     trail: Vec<Step>,      // decision/deduced trail
-    propagated: usize,     // how many literals propagated ?
+    propagated: usize,     // how many literals are propagated ?
+    current_level: usize,
+    level: Vec<Option<usize>>,
+    reason: Vec<Option<usize>>, // reason clause of deduction for CDCL
+    analysis_marked: Vec<bool>,
 }
 
 impl Solver {
@@ -256,7 +287,7 @@ impl Solver {
         let db = p
             .clause
             .into_iter()
-            .map(|x| Clause { lits: x })
+            .map(|x| Clause::new(x))
             .collect::<Vec<_>>();
 
         let mut clause_map = ClauseMap::new(p.variables);
@@ -270,44 +301,141 @@ impl Solver {
             clause_map,
             trail: Vec::with_capacity(p.variables),
             propagated: 0,
+            current_level: 0,
+            level: vec![None; p.variables + 1],
+            reason: vec![None; p.variables + 1],
+            analysis_marked: vec![false; p.variables + 1],
         }
     }
 
     fn run(&mut self) -> bool {
         loop {
             while let Some(conflict) = self.bcp() {
-                if !self.resolve_conflict_cdcl(conflict) {
+                if self.current_level == 0 {
                     return false; // UNSAT
                 }
+                self.resolve_conflict_cdcl(conflict);
             }
 
             if let Some(l) = self.decide() {
                 self.assigns.set_negative(l);
                 self.trail.push(Step::Decided(l));
+                self.current_level += 1;
+                self.level[l.abs() as usize] = Some(self.current_level);
+                self.reason[l.abs() as usize] = None;
             } else {
-                //assert!(self.db.iter().all(|c| !c.is_all_false(&self.assigns)));
+                assert!(self.db.iter().all(|c| !c.is_all_false(&self.assigns)));
                 return true; // SAT
             }
         }
     }
 
-    fn resolve_conflict_dpll(&mut self) -> bool {
+    #[allow(dead_code)]
+    fn resolve_conflict_dpll(&mut self) {
         while let Some(step) = self.trail.pop() {
             match step {
-                Step::Deduced(l) => self.assigns.set_undef(l),
+                Step::Deduced(l) => {
+                    self.assigns.set_undef(l);
+                    self.level[l.abs() as usize] = None;
+                }
                 Step::Decided(l) => {
                     self.propagated = self.trail.len(); // set back propagate level
                     self.assigns.set_negative(-l);
                     self.trail.push(Step::Deduced(-l));
-                    return true;
+                    self.current_level -= 1; // modify decision level
+                    self.level[l.abs() as usize] = Some(self.current_level);
+                    return;
                 }
             }
         }
-        false // UNSAT
     }
 
-    fn resolve_conflict_cdcl(&mut self, conflict: usize) -> bool {
-        self.resolve_conflict_dpll()
+    fn back_jump(&mut self, lv: usize) {
+        while self.current_level > lv {
+            match self.trail.pop() {
+                Some(Step::Deduced(l)) => {
+                    self.assigns.set_undef(l);
+                    self.level[l.abs() as usize] = None;
+                    self.reason[l.abs() as usize] = None;
+                }
+                Some(Step::Decided(l)) => {
+                    self.assigns.set_undef(l);
+                    self.level[l.abs() as usize] = None;
+                    self.current_level -= 1;
+                }
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!(lv, self.current_level);
+    }
+
+    // linear-time first uip calculation
+    // https://efforeffort.wordpress.com/2009/03/09/linear-time-first-uip-calculation/
+    fn analyze(&mut self, conflict: usize) -> (Clause, usize) {
+        let mut learnt = vec![0]; // dummy for first UIP
+        let mut current_level_literals: usize = 0;
+        let mut trail_last = self.trail.len();
+        let mut literal;
+        let mut reason_id = conflict;
+        loop {
+            let reason = &self.db[reason_id];
+            for i in 0..reason.len() {
+                let lit = reason[i];
+                let var = lit.abs() as usize;
+                if self.analysis_marked[var] {
+                    continue;
+                }
+                self.analysis_marked[var] = true;
+                if self.level[var] == Some(self.current_level) {
+                    current_level_literals += 1;
+                } else {
+                    learnt.push(lit);
+                }
+            }
+
+            loop {
+                trail_last -= 1;
+                literal = self.trail[trail_last].literal();
+                if self.analysis_marked[literal.abs() as usize] {
+                    break;
+                }
+            }
+
+            if current_level_literals == 1 {
+                break;
+            }
+
+            reason_id = self.reason[literal.abs() as usize].unwrap();
+            current_level_literals -= 1;
+        }
+
+        // reset mark
+        for i in trail_last..self.trail.len() {
+            self.analysis_marked[self.trail[i].literal().abs() as usize] = false;
+        }
+        for &i in &learnt {
+            self.analysis_marked[i.abs() as usize] = false;
+        }
+
+        assert_ne!(0, literal);
+        learnt[0] = literal;
+        let lv = learnt[1..]
+            .iter()
+            .fold(0, |lv, &l| lv.max(self.level[l.abs() as usize].unwrap()));
+        (Clause::new(learnt), lv)
+    }
+
+    fn resolve_conflict_cdcl(&mut self, conflict: usize) {
+        let (learnt, lv) = self.analyze(conflict); // fuip must be assigned to true
+        let first_uip = learnt[0];
+        self.db.push(learnt);
+        self.back_jump(lv);
+        // assigned true for fuip
+        self.propagated = self.trail.len();
+        self.assigns.set_negative(-first_uip);
+        self.trail.push(Step::Deduced(-first_uip));
+        self.level[first_uip.abs() as usize] = Some(self.current_level);
+        self.reason[first_uip.abs() as usize] = Some(self.db.len() - 1);
     }
 
     // return selected literal which assigned false
@@ -342,6 +470,8 @@ impl Solver {
                     Implied(unit) => {
                         self.assigns.set_negative(-unit);
                         self.trail.push(Step::Deduced(-unit));
+                        self.level[unit.abs() as usize] = Some(self.current_level);
+                        self.reason[unit.abs() as usize] = Some(idx);
                     }
                     Satisfied => (),
                     Conflict => {
