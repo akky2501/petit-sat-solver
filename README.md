@@ -18,6 +18,7 @@ $ cargo run --release bench/uf100/uf100-01.cnf
 - [ ] Learnt Clause Elimination
 - [ ] VSIDS
 - [ ] restarting
+- [ ] Learnt Clause Minimization
 
 
 ## Author
