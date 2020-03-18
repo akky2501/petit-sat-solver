@@ -11,14 +11,15 @@ $ cargo run --release bench/uf100/uf100-01.cnf
 
 ## Status
 
-- [x] Parse DIMACS format text
+- [x] parse DIMACS format text
 - [x] DPLL
 - [x] 2 Watch Literal
 - [x] CDCL (linear-time first uip calculation)
-- [ ] Learnt Clause Elimination
-- [ ] VSIDS
+- [ ] learnt clause elimination
+- [ ] learnt clause minimization
+- [x] VSIDS
+- [ ] phase caching
 - [ ] restarting
-- [ ] Learnt Clause Minimization
 
 
 ## Author

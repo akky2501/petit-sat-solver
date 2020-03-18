@@ -269,6 +269,105 @@ impl Step {
 }
 
 #[derive(Debug)]
+struct VSIDSSelector {
+    activity: Vec<usize>, // maping var to score
+    tree: Vec<usize>,     // binary heap of var compared with activity
+    index: Vec<usize>,    // mapping var to heap index
+    bump_constant: usize,
+    bump_max: usize,
+}
+
+impl VSIDSSelector {
+    fn new(n: usize, k: usize, m: usize) -> Self {
+        // construct heap tree
+        let tree = (0..=n).into_iter().collect::<Vec<_>>();
+        let index = (0..=n).into_iter().collect::<Vec<_>>();
+        VSIDSSelector {
+            activity: vec![0; n + 1],
+            tree,
+            index,
+            bump_constant: k,
+            bump_max: m,
+        }
+    }
+
+    fn bubble_up(&mut self, n: usize) {
+        let mut n = n; // n is current, n/2 is parent
+        while n > 1 {
+            let u = self.tree[n];
+            let v = self.tree[n / 2];
+            if self.activity[u] < self.activity[v] {
+                break;
+            }
+            self.index.swap(self.tree[n], self.tree[n / 2]);
+            self.tree.swap(n, n / 2);
+            n /= 2;
+        }
+    }
+
+    fn bubble_down(&mut self, n: usize) {
+        let mut l = 2 * n;
+        while l < self.tree.len() {
+            let n = l / 2;
+            let r = l + 1;
+            if r < self.tree.len() && self.activity[self.tree[l]] < self.activity[self.tree[r]] {
+                l = r;
+            }
+            if self.activity[self.tree[n]] >= self.activity[self.tree[l]] {
+                break;
+            }
+            self.index.swap(self.tree[n], self.tree[l]);
+            self.tree.swap(n, l);
+            l *= 2;
+        }
+    }
+
+    fn bump(&mut self) {
+        // dividing all element do not change heap relation
+        for score in self.activity.iter_mut() {
+            *score /= self.bump_constant;
+        }
+    }
+
+    fn increment(&mut self, var: Var) {
+        self.activity[var as usize] += 1;
+        if self.activity[var as usize] > self.bump_max {
+            self.bump();
+        }
+        // if var is in heap, bubble up
+        let i = self.index[var as usize];
+        if i != 0 {
+            self.bubble_up(i);
+        }
+    }
+
+    fn insert(&mut self, var: Var) {
+        if self.index[var as usize] != 0 {
+            return;
+        }
+        let n = self.tree.len();
+        self.tree.push(var as usize);
+        self.index[var as usize] = n;
+        self.bubble_up(n);
+    }
+
+    fn pickup(&mut self) -> Option<Var> {
+        let len = self.tree.len();
+        if len <= 1 {
+            return None;
+        }
+        let top = self.tree[1];
+        self.tree.swap(1, len - 1);
+        let new_top = self.tree[1];
+        self.tree.pop();
+        self.index[new_top] = 1;
+        self.index[top] = 0;
+        self.bubble_down(1);
+        Some(top as Var)
+    }
+}
+
+#[derive(Debug)]
 struct Solver {
     assigns: Assignment,   // assigns of variables
     db: Vec<Clause>,       // clause data base
@@ -279,6 +378,7 @@ struct Solver {
     level: Vec<Option<usize>>,
     reason: Vec<Option<usize>>, // reason clause of deduction for CDCL
     analysis_marked: Vec<bool>,
+    selector: VSIDSSelector,
 }
 
 impl Solver {
@@ -295,6 +395,7 @@ impl Solver {
             clause_map.insert(c.lits[0], idx); // watch literal/clause
             clause_map.insert(c.lits[1], idx);
         }
+        let selector = VSIDSSelector::new(p.variables, 10000, 100000000);
         Solver {
             assigns: Assignment::new(p.variables),
             db,
@@ -305,6 +406,7 @@ impl Solver {
             level: vec![None; p.variables + 1],
             reason: vec![None; p.variables + 1],
             analysis_marked: vec![false; p.variables + 1],
+            selector,
         }
     }
 
@@ -317,7 +419,7 @@ impl Solver {
                 self.resolve_conflict_cdcl(conflict);
             }
 
-            if let Some(l) = self.decide() {
+            if let Some(l) = self.decide_vsids() {
                 self.assigns.set_negative(l);
                 self.trail.push(Step::Decided(l));
                 self.current_level += 1;
@@ -355,11 +457,13 @@ impl Solver {
             match self.trail.pop() {
                 Some(Step::Deduced(l)) => {
                     self.assigns.set_undef(l);
+                    self.selector.insert(l.abs() as Var);
                     self.level[l.abs() as usize] = None;
                     self.reason[l.abs() as usize] = None;
                 }
                 Some(Step::Decided(l)) => {
                     self.assigns.set_undef(l);
+                    self.selector.insert(l.abs() as Var);
                     self.level[l.abs() as usize] = None;
                     self.current_level -= 1;
                 }
@@ -428,6 +532,9 @@ impl Solver {
     fn resolve_conflict_cdcl(&mut self, conflict: usize) {
         let (learnt, lv) = self.analyze(conflict); // fuip must be assigned to true
         let first_uip = learnt[0];
+        for i in 0..learnt.len() {
+            self.selector.increment(learnt[i].abs() as u32);
+        }
         self.db.push(learnt);
         self.back_jump(lv);
         // assigned true for fuip
@@ -446,6 +553,18 @@ impl Solver {
                 return Some(-l);
             }
         }
+        assert_eq!(self.assigns.count(), self.trail.len());
+        None
+    }
+
+    fn decide_vsids(&mut self) -> Option<Lit> {
+        while let Some(var) = self.selector.pickup() {
+            let l = var as Lit;
+            if self.assigns[l].is_undef() {
+                return Some(-l);
+            }
+        }
+        assert_eq!(self.assigns.count(), self.trail.len());
         None
     }
 
