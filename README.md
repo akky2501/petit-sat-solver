@@ -18,7 +18,7 @@ $ cargo run --release bench/uf100/uf100-01.cnf
 - [ ] learnt clause elimination
 - [ ] learnt clause minimization
 - [x] VSIDS
-- [ ] phase caching
+- [x] phase caching
 - [ ] restarting
 
 

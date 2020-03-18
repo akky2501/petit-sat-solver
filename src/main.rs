@@ -379,6 +379,7 @@ struct Solver {
     reason: Vec<Option<usize>>, // reason clause of deduction for CDCL
     analysis_marked: Vec<bool>,
     selector: VSIDSSelector,
+    polarity: Vec<AssignmentCell>,
 }
 
 impl Solver {
@@ -407,6 +408,7 @@ impl Solver {
             reason: vec![None; p.variables + 1],
             analysis_marked: vec![false; p.variables + 1],
             selector,
+            polarity: vec![AssignmentCell::UnDef; p.variables + 1],
         }
     }
 
@@ -456,12 +458,14 @@ impl Solver {
         while self.current_level > lv {
             match self.trail.pop() {
                 Some(Step::Deduced(l)) => {
+                    self.polarity[l.abs() as usize] = self.assigns[l.abs()];
                     self.assigns.set_undef(l);
                     self.selector.insert(l.abs() as Var);
                     self.level[l.abs() as usize] = None;
                     self.reason[l.abs() as usize] = None;
                 }
                 Some(Step::Decided(l)) => {
+                    self.polarity[l.abs() as usize] = self.assigns[l.abs()];
                     self.assigns.set_undef(l);
                     self.selector.insert(l.abs() as Var);
                     self.level[l.abs() as usize] = None;
@@ -560,8 +564,12 @@ impl Solver {
     fn decide_vsids(&mut self) -> Option<Lit> {
         while let Some(var) = self.selector.pickup() {
             let l = var as Lit;
-            if self.assigns[l].is_undef() {
-                return Some(-l);
+            if self.assigns[l as Lit].is_undef() {
+                return match self.polarity[l as usize] {
+                    AssignmentCell::UnDef => Some(l),
+                    AssignmentCell::Def(false) => Some(l),
+                    AssignmentCell::Def(true) => Some(-l),
+                };
             }
         }
         assert_eq!(self.assigns.count(), self.trail.len());
